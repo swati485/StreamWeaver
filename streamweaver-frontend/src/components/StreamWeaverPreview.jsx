@@ -1,0 +1,1187 @@
+import React, { useState, useRef, useCallback, useMemo, useEffect } from "react";
+import Papa from "papaparse";
+import { FixedSizeList as List } from "react-window";
+import {
+  Upload,
+  FileSpreadsheet,
+  RotateCcw,
+  Gauge,
+  Rows3,
+  Columns3,
+  AlertTriangle,
+  CheckCircle2,
+  HardDrive,
+  Table2,
+  Waypoints,
+  ArrowRight,
+  Copy,
+  Check,
+  Code2,
+  Send,
+  Loader2,
+  ServerCrash,
+  PartyPopper,
+} from "lucide-react";
+
+const UPLOAD_ENDPOINT = "http://localhost:3000/upload";
+
+
+const ROW_HEIGHT = 34;
+const HEADER_HEIGHT = 40;
+const PREVIEW_LIMIT = 1000;
+const OVERSCAN = 6;
+const MIN_COL_WIDTH = 130;
+const MAX_COL_WIDTH = 260;
+
+function formatBytes(bytes) {
+  if (!bytes) return "0 KB";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let n = bytes;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n.toFixed(n >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatNumber(n) {
+  return new Intl.NumberFormat("en-US").format(Math.round(n));
+}
+
+function colWidthFor(headerText, sampleValues) {
+  let longest = (headerText || "").length;
+  for (const v of sampleValues) {
+    const len = (v || "").length;
+    if (len > longest) longest = len;
+  }
+  return Math.min(MAX_COL_WIDTH, Math.max(MIN_COL_WIDTH, longest * 8.2 + 28));
+}
+
+function suggestFieldName(header, index) {
+  const cleaned = (header || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || `field_${index + 1}`;
+}
+
+// Runs a user-typed JS expression against a single sample value, purely for
+// live preview inside this tab. Wrapped in try/catch so a bad expression
+// just shows an error chip instead of breaking the UI.
+function applyTransformPreview(rawValue, transformStr) {
+  if (!transformStr || !transformStr.trim()) return { ok: true, value: rawValue };
+  try {
+    // eslint-disable-next-line no-new-func
+    const fn = new Function("value", `"use strict"; return (${transformStr});`);
+    const result = fn(rawValue);
+    return { ok: true, value: result === undefined || result === null ? "" : String(result) };
+  } catch (e) {
+    return { ok: false, value: e.message || "invalid expression" };
+  }
+}
+
+export default function StreamWeaverPreview() {
+  const [status, setStatus] = useState("idle"); 
+  const [fileName, setFileName] = useState("");
+  const [fileSize, setFileSize] = useState(0);
+  const [progress, setProgress] = useState(0);
+  const [rowsSeen, setRowsSeen] = useState(0);
+  const [rate, setRate] = useState(0);
+  const [columns, setColumns] = useState([]);
+  const [previewRows, setPreviewRows] = useState([]);
+  const [errorRowCount, setErrorRowCount] = useState(0);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [dragActive, setDragActive] = useState(false);
+  const [gridHeight, setGridHeight] = useState(520);
+  const [mountedRange, setMountedRange] = useState({ start: 0, end: 0 });
+
+  const [viewMode, setViewMode] = useState("grid"); 
+  const [mappings, setMappings] = useState([]);
+  const [copied, setCopied] = useState(false);
+
+  // Real backend upload — separate from the client-side preview above.
+  
+  const [sendState, setSendState] = useState("idle");
+  const [sendProgress, setSendProgress] = useState({ rows: 0, progress: 0, rate: 0 });
+  const [sendError, setSendError] = useState("");
+  const [sendWarnings, setSendWarnings] = useState([]);
+  const wsRef = useRef(null);
+
+  const fileInputRef = useRef(null);
+  const rawFileRef = useRef(null); // holds the actual File object for the real upload
+  const bufferRef = useRef([]);
+  const headerRef = useRef(null);
+  const rowCountRef = useRef(0);
+  const errCountRef = useRef(0);
+  const lastTickRef = useRef(0);
+  const lastTickRowsRef = useRef(0);
+  const parserRef = useRef(null);
+  const gridWrapRef = useRef(null);
+
+  const reset = useCallback(() => {
+    setStatus("idle");
+    setFileName("");
+    setFileSize(0);
+    setProgress(0);
+    setRowsSeen(0);
+    setRate(0);
+    setColumns([]);
+    setPreviewRows([]);
+    setErrorRowCount(0);
+    setErrorMsg("");
+    setMountedRange({ start: 0, end: 0 });
+    setViewMode("grid");
+    setMappings([]);
+    setCopied(false);
+    setSendState("idle");
+    setSendProgress({ rows: 0, progress: 0, rate: 0 });
+    setSendError("");
+    setSendWarnings([]);
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+    bufferRef.current = [];
+    headerRef.current = null;
+    rowCountRef.current = 0;
+    errCountRef.current = 0;
+    rawFileRef.current = null;
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }, []);
+
+  const beginParse = useCallback(
+    (file) => {
+      reset();
+      rawFileRef.current = file;
+      setStatus("parsing");
+      setFileName(file.name);
+      setFileSize(file.size);
+      bufferRef.current = [];
+      headerRef.current = null;
+      rowCountRef.current = 0;
+      errCountRef.current = 0;
+      lastTickRef.current = performance.now();
+      lastTickRowsRef.current = 0;
+
+      Papa.parse(file, {
+        worker: false,
+        skipEmptyLines: true,
+        step: (results, parser) => {
+          parserRef.current = parser;
+          const row = results.data;
+
+          if (!headerRef.current) {
+            headerRef.current = row;
+          } else {
+            rowCountRef.current += 1;
+            if (row.length !== headerRef.current.length) {
+              errCountRef.current += 1;
+            }
+            if (bufferRef.current.length < PREVIEW_LIMIT) {
+              bufferRef.current.push(row);
+            }
+          }
+
+          const now = performance.now();
+          if (now - lastTickRef.current > 120) {
+            const dt = (now - lastTickRef.current) / 1000;
+            const dRows = rowCountRef.current - lastTickRowsRef.current;
+            setRate(dt > 0 ? dRows / dt : 0);
+            setRowsSeen(rowCountRef.current);
+            setErrorRowCount(errCountRef.current);
+            const cursor = results.meta && results.meta.cursor ? results.meta.cursor : 0;
+            setProgress(file.size > 0 ? Math.min(100, (cursor / file.size) * 100) : 0);
+            lastTickRef.current = now;
+            lastTickRowsRef.current = rowCountRef.current;
+          }
+        },
+        complete: () => {
+          const header = headerRef.current || [];
+          const sample = bufferRef.current.slice(0, 50);
+          const cols = header.map((h, i) => ({
+            key: `c${i}`,
+            label: h && h.trim() ? h : `Column ${i + 1}`,
+            width: colWidthFor(h, sample.map((r) => r[i])),
+          }));
+          setColumns(cols);
+          setPreviewRows(bufferRef.current);
+          setMappings(
+            cols.map((c, i) => ({
+              key: c.key,
+              sourceIndex: i,
+              source: c.label,
+              destination: suggestFieldName(c.label, i),
+              transform: "",
+              include: true,
+            }))
+          );
+          setRowsSeen(rowCountRef.current);
+          setErrorRowCount(errCountRef.current);
+          setProgress(100);
+          setRate(0);
+          setStatus("ready");
+        },
+        error: (err) => {
+          setErrorMsg(err && err.message ? err.message : "Could not parse this file.");
+          setStatus("error");
+        },
+      });
+    },
+    [reset]
+  );
+
+  const handleFiles = useCallback(
+    (files) => {
+      const file = files && files[0];
+      if (!file) return;
+      if (!/\.csv$/i.test(file.name)) {
+        setErrorMsg("StreamWeaver preview only reads .csv files right now.");
+        setStatus("error");
+        return;
+      }
+      beginParse(file);
+    },
+    [beginParse]
+  );
+
+
+  const onDrop = useCallback(
+    (e) => {
+      e.preventDefault();
+      setDragActive(false);
+      handleFiles(e.dataTransfer.files);
+    },
+    [handleFiles]
+  );
+
+  const dropTargetActive = status === "idle" || status === "error";
+
+  // ---- measure grid viewport so react-window knows its pixel height ------
+  useEffect(() => {
+    if (status !== "ready" || viewMode !== "grid" || !gridWrapRef.current) return;
+    const el = gridWrapRef.current;
+    const update = () => setGridHeight(el.clientHeight || 520);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [status, viewMode]);
+
+  const totalRows = previewRows.length;
+  const totalGridWidth = useMemo(
+    () => Math.max(columns.reduce((sum, c) => sum + c.width, 0), 640),
+    [columns]
+  );
+
+  // react-window calls this every time the mounted window of rows changes —
+  // it's how we know, at any moment, exactly how many DOM rows actually exist.
+  const handleItemsRendered = useCallback(({ overscanStartIndex, overscanStopIndex }) => {
+    setMountedRange({ start: overscanStartIndex, end: overscanStopIndex });
+  }, []);
+
+  const Row = useCallback(
+    ({ index, style }) => {
+      const row = previewRows[index];
+      return (
+        <div
+          style={{
+            ...style,
+            display: "flex",
+            background: index % 2 === 0 ? "#0E1420" : "#111826",
+            borderBottom: "1px solid #161D28",
+          }}
+        >
+          {columns.map((c, ci) => (
+            <div key={c.key} style={{ ...styles.dataCell, width: c.width }}>
+              {row && row[ci] !== undefined ? row[ci] : ""}
+            </div>
+          ))}
+        </div>
+      );
+    },
+    [previewRows, columns]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (parserRef.current) parserRef.current.abort();
+    };
+  }, []);
+
+  // ---- mapping helpers -----------------------------------------------------
+  const updateMapping = useCallback((key, patch) => {
+    setMappings((prev) => prev.map((m) => (m.key === key ? { ...m, ...patch } : m)));
+  }, []);
+
+  const mappedCount = mappings.filter((m) => m.include).length;
+
+  const mappingPayload = useMemo(
+    () =>
+      mappings
+        .filter((m) => m.include)
+        .map((m) => ({
+          source: m.source,
+          sourceIndex: m.sourceIndex,
+          destination: m.destination || suggestFieldName(m.source, m.sourceIndex),
+          transform: m.transform || null,
+        })),
+    [mappings]
+  );
+
+  const copyMappingJSON = useCallback(async () => {
+    const text = JSON.stringify(mappingPayload, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // Clipboard API can fail in insecure contexts; fail silently, the
+      // button just won't show the "copied" confirmation.
+    }
+  }, [mappingPayload]);
+
+  const startRealUpload = useCallback(async () => {
+    const file = rawFileRef.current;
+    if (!file) {
+      setSendState("error");
+      setSendError("No file reference available — try reselecting the file.");
+      return;
+    }
+
+    setSendState("sending");
+    setSendProgress({ rows: 0, progress: 0, rate: 0 });
+    setSendError("");
+    setSendWarnings([]);
+
+    const uploadId = crypto.randomUUID();
+    const ws = new WebSocket(`ws://localhost:3000?uploadId=${uploadId}`);
+    wsRef.current = ws;
+    ws.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.warning) setSendWarnings((w) => [...w, payload.warning]);
+        else if (payload.rows !== undefined)
+          setSendProgress({ rows: payload.rows, progress: payload.progress || 0, rate: payload.rate || 0 });
+        if (payload.done) setSendState("done");
+      } catch { /* ignore malformed frames */ }
+    };
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file, file.name);
+
+      const response = await fetch(UPLOAD_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "x-file-size": String(file.size),
+          "x-upload-id": uploadId,
+          "x-mapping-rules": encodeURIComponent(JSON.stringify(mappingPayload)),
+        },
+        body: formData,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Server responded ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const events = buffer.split("\n\n");
+        buffer = events.pop(); // last chunk may be incomplete, keep it for next read
+
+        for (const evt of events) {
+          const line = evt.trim();
+          if (!line.startsWith("data:")) continue;
+          let payload;
+          try {
+            payload = JSON.parse(line.slice(5).trim());
+          } catch {
+            continue;
+          }
+          if (payload.error) {
+            setSendState("error");
+            setSendError(payload.error);
+            return;
+          }
+          if (payload.warning) { setSendWarnings((w) => [...w, payload.warning]); continue; }
+          setSendProgress({
+            rows: payload.rows || 0,
+            progress: payload.progress || 0,
+            rate: payload.rate || 0,
+          });
+          if (payload.done) setSendState("done");
+        }
+      }
+
+      setSendState((s) => (s === "sending" ? "done" : s));
+    } catch (err) {
+      if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+      setSendState("error");
+      setSendError(
+        err && err.message
+          ? `${err.message} — is the backend running at ${UPLOAD_ENDPOINT}?`
+          : "Upload failed."
+      );
+    }
+  }, [mappingPayload]);
+
+  const firstRow = previewRows[0];
+
+  return (
+    <div
+      style={styles.app}
+      onDragOver={
+        dropTargetActive
+          ? (e) => {
+              e.preventDefault();
+              setDragActive(true);
+            }
+          : undefined
+      }
+      onDragLeave={dropTargetActive ? () => setDragActive(false) : undefined}
+      onDrop={dropTargetActive ? onDrop : undefined}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+        html, body, #root { height: 100%; width: 100%; margin: 0; padding: 0; }
+        #root { max-width: none !important; text-align: left; display: block; }
+        body { background: #0B0F14; display: block; place-items: unset; }
+        * { box-sizing: border-box; }
+        .sw-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+        .sw-scroll::-webkit-scrollbar-track { background: #10161F; }
+        .sw-scroll::-webkit-scrollbar-thumb { background: #2A3341; border-radius: 6px; }
+        .sw-scroll::-webkit-scrollbar-thumb:hover { background: #3A4557; }
+        @keyframes sw-thread {
+          0% { stroke-dashoffset: 0; }
+          100% { stroke-dashoffset: -48; }
+        }
+        @keyframes sw-fade-up {
+          from { opacity: 0; transform: translateY(6px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .sw-thread-line { stroke-dasharray: 6 6; animation: sw-thread 1.4s linear infinite; }
+        @keyframes sw-spin { to { transform: rotate(360deg); } }
+        .sw-spin { animation: sw-spin 0.9s linear infinite; }
+        .sw-ring { transition: border-color 0.18s ease, background 0.18s ease; }
+        .sw-ring.drag { border-color: #E8A33D !important; background: rgba(232,163,61,0.05) !important; }
+        .sw-hero { animation: sw-fade-up 0.4s ease both; }
+        .sw-map-input {
+          background: #0E1420;
+          border: 1px solid #232B38;
+          color: #E8ECF1;
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 12.5px;
+          border-radius: 6px;
+          padding: 7px 9px;
+          outline: none;
+          width: 100%;
+        }
+        .sw-map-input:focus { border-color: #E8A33D; }
+        .sw-map-input::placeholder { color: #4A5361; }
+        .sw-seg-btn {
+          display: flex; align-items: center; gap: 6px;
+          background: transparent; border: none; color: #7C8798;
+          font-family: 'Inter', sans-serif; font-size: 12.5px; font-weight: 600;
+          padding: 7px 13px; border-radius: 6px; cursor: pointer;
+        }
+        .sw-seg-btn.active { background: #1B222D; color: #E8ECF1; }
+      `}</style>
+
+      <WeaveBackdrop active={status === "parsing"} />
+
+      <header style={styles.header}>
+        <div style={styles.brandRow}>
+          <LoomMark />
+          <div>
+            <div style={styles.brandName}>StreamWeaver</div>
+            <div style={styles.brandTag}>No-code ETL that never runs out of memory</div>
+          </div>
+        </div>
+        {status === "ready" && (
+          <button style={styles.resetBtn} onClick={reset}>
+            <RotateCcw size={14} />
+            New file
+          </button>
+        )}
+      </header>
+
+      {dropTargetActive && (
+        <div style={styles.heroWrap}>
+          <div className={`sw-ring${dragActive ? " drag" : ""}`} style={styles.dropRing} />
+          <div
+            className="sw-hero"
+            style={styles.hero}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                fileInputRef.current && fileInputRef.current.click();
+              }
+            }}
+          >
+            <Upload size={30} color="#E8A33D" strokeWidth={1.6} />
+            <div style={styles.dropTitle}>Drop a CSV to preview the first 1,000 rows</div>
+            <div style={styles.dropSub}>
+              Parsed in chunks as it streams in — a 5&nbsp;GB file won't freeze this tab.
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv"
+              style={{ display: "none" }}
+              onChange={(e) => handleFiles(e.target.files)}
+            />
+            <button style={styles.browseBtn} onClick={() => fileInputRef.current && fileInputRef.current.click()}>
+              Browse files
+            </button>
+            <div style={styles.dropHint}>or drop it anywhere on this page</div>
+            {status === "error" && (
+              <div style={styles.errorLine}>
+                <AlertTriangle size={14} color="#E85D5D" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {status === "parsing" && (
+        <div style={styles.heroWrap}>
+          
+          <div className="sw-hero" style={styles.hero}>
+            
+            <div style={styles.dropTitle}>Weaving through {fileName}…</div>
+            <div style={styles.dropSub}>{formatBytes(fileSize)} total</div>
+            <div style={styles.progressTrack}>
+              <div style={{ ...styles.progressFill, width: `${progress}%` }} />
+            </div>
+            <div style={styles.parsingStats}>
+              <span>{formatNumber(progress)}% streamed</span>
+              <span>·</span>
+              <span>{formatNumber(rowsSeen)} rows seen</span>
+              <span>·</span>
+              <span>{formatNumber(rate)} rows/sec</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {status === "ready" && (
+        <div style={styles.readyWrap}>
+          <div style={styles.statsBar}>
+            <Stat icon={<Rows3 size={15} color="#7C8798" />} label="rows parsed" value={formatNumber(rowsSeen)} />
+            <Stat icon={<Columns3 size={15} color="#7C8798" />} label="columns" value={formatNumber(columns.length)} />
+            <Stat icon={<HardDrive size={15} color="#7C8798" />} label="file size" value={formatBytes(fileSize)} />
+            <Stat
+              icon={
+                errorRowCount > 0 ? (
+                  <AlertTriangle size={15} color="#E8A33D" />
+                ) : (
+                  <CheckCircle2 size={15} color="#57C278" />
+                )
+              }
+              label="malformed rows"
+              value={formatNumber(errorRowCount)}
+              tone={errorRowCount > 0 ? "warn" : "ok"}
+            />
+
+            <div style={styles.statsSpacer} />
+
+            <div style={styles.segControl}>
+              <button
+                className={`sw-seg-btn${viewMode === "grid" ? " active" : ""}`}
+                onClick={() => setViewMode("grid")}
+              >
+                <Table2 size={14} />
+                Grid
+              </button>
+              <button
+                className={`sw-seg-btn${viewMode === "mapping" ? " active" : ""}`}
+                onClick={() => setViewMode("mapping")}
+              >
+                <Waypoints size={14} />
+                Mapping
+              </button>
+            </div>
+          </div>
+
+          {viewMode === "grid" && (
+            <>
+              <div ref={gridWrapRef} style={{ ...styles.gridWrap, maxWidth: totalGridWidth + 24, margin: "0 auto" }}>
+                <div className="sw-scroll" style={styles.gridScrollX}>
+                  <div style={{ width: totalGridWidth }}>
+                    <div style={{ ...styles.headerRow, width: totalGridWidth }}>
+                      {columns.map((c) => (
+                        <div key={c.key} style={{ ...styles.headerCell, width: c.width }}>
+                          {c.label}
+                        </div>
+                      ))}
+                    </div>
+                    {gridHeight > HEADER_HEIGHT && (
+                      <List
+                        className="sw-scroll"
+                        height={gridHeight - HEADER_HEIGHT}
+                        width={totalGridWidth}
+                        itemCount={totalRows}
+                        itemSize={ROW_HEIGHT}
+                        overscanCount={OVERSCAN}
+                        onItemsRendered={handleItemsRendered}
+                        style={{ overflowX: "hidden" }}
+                      >
+                        {Row}
+                      </List>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div style={styles.footNote}>
+                <FileSpreadsheet size={13} color="#5A6472" />
+                {fileName} · react-window has only {formatNumber(mountedRange.end - mountedRange.start + 1)} of{" "}
+                {formatNumber(totalRows)} preview rows mounted to the DOM right now
+              </div>
+            </>
+          )}
+
+          {viewMode === "mapping" && (
+            <>
+              <div style={styles.mapToolbar}>
+                <div style={styles.mapToolbarText}>
+                  {formatNumber(mappedCount)} of {formatNumber(columns.length)} columns will be sent
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button style={styles.copyBtn} onClick={copyMappingJSON}>
+                    {copied ? <Check size={14} color="#57C278" /> : <Copy size={14} />}
+                    {copied ? "Copied" : "Copy mapping JSON"}
+                  </button>
+                  <button
+                    style={{
+                      ...styles.sendBtn,
+                      opacity: sendState === "sending" || mappedCount === 0 ? 0.6 : 1,
+                      cursor: sendState === "sending" || mappedCount === 0 ? "default" : "pointer",
+                    }}
+                    onClick={startRealUpload}
+                    disabled={sendState === "sending" || mappedCount === 0}
+                  >
+                    {sendState === "sending" ? (
+                      <Loader2 size={14} className="sw-spin" />
+                    ) : (
+                      <Send size={14} />
+                    )}
+                    {sendState === "sending" ? "Streaming to server…" : "Send full file to server"}
+                  </button>
+                </div>
+              </div>
+
+              {sendState !== "idle" && (
+                <div style={styles.sendPanel}>
+                  {sendState === "sending" && (
+                    <>
+                      <div style={styles.sendRow}>
+                        <Loader2 size={15} color="#E8A33D" className="sw-spin" />
+                        <span style={styles.sendTitle}>
+                          Streaming the full file through busboy → CSVTransform → MongoDB…
+                        </span>
+                      </div>
+                      <div style={styles.progressTrack2}>
+                        <div style={{ ...styles.progressFill, width: `${sendProgress.progress}%` }} />
+                      </div>
+                      <div style={styles.parsingStats}>
+                        <span>{formatNumber(sendProgress.progress)}% streamed</span>
+                        <span>·</span>
+                        <span>{formatNumber(sendProgress.rows)} rows inserted</span>
+                        <span>·</span>
+                        <span>{formatNumber(sendProgress.rate)} rows/sec</span>
+                      </div>
+                    </>
+                  )}
+                  {sendWarnings.length > 0 && (
+                    <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 4 }}>
+                      {sendWarnings.map((w, i) => (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                          <AlertTriangle size={13} color="#E8A33D" />
+                          <span style={{ fontSize: 12, color: "#E8A33D", fontFamily: "'IBM Plex Mono', monospace" }}>{w}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {sendState === "done" && (
+                    <div style={styles.sendRow}>
+                      <PartyPopper size={16} color="#57C278" />
+                      <span style={styles.sendTitle}>
+                        Done — {formatNumber(sendProgress.rows)} rows bulk-written to MongoDB.
+                        {sendWarnings.length > 0 && ` (${sendWarnings.length} batch warning${sendWarnings.length > 1 ? "s" : ""})`}
+                      </span>
+                    </div>
+                  )}
+                  {sendState === "error" && (
+                    <div style={styles.sendRow}>
+                      <ServerCrash size={16} color="#E85D5D" />
+                      <span style={{ ...styles.sendTitle, color: "#E85D5D" }}>{sendError}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="sw-scroll" style={styles.mapWrap}>
+                <div style={styles.mapHeaderRow}>
+                  <div style={{ ...styles.mapHeadCell, width: 34 }}></div>
+                  <div style={{ ...styles.mapHeadCell, width: 180 }}>Source column</div>
+                  <div style={{ ...styles.mapHeadCell, width: 24 }}></div>
+                  <div style={{ ...styles.mapHeadCell, width: 190 }}>Destination field</div>
+                  <div style={{ ...styles.mapHeadCell, flex: 1, minWidth: 220 }}>Transform (optional JS)</div>
+                  <div style={{ ...styles.mapHeadCell, width: 170 }}>Preview</div>
+                </div>
+
+                {mappings.map((m) => {
+                  const rawSample = firstRow ? firstRow[m.sourceIndex] : "";
+                  const preview = applyTransformPreview(rawSample, m.transform);
+                  return (
+                    <div
+                      key={m.key}
+                      style={{ ...styles.mapRow, opacity: m.include ? 1 : 0.4 }}
+                    >
+                      <div style={{ width: 34, display: "flex", alignItems: "center" }}>
+                        <input
+                          type="checkbox"
+                          checked={m.include}
+                          onChange={(e) => updateMapping(m.key, { include: e.target.checked })}
+                          style={{ width: 16, height: 16, accentColor: "#E8A33D", cursor: "pointer" }}
+                        />
+                      </div>
+                      <div style={{ width: 180, ...styles.mapSourceLabel }} title={m.source}>
+                        {m.source}
+                      </div>
+                      <div style={{ width: 24, display: "flex", justifyContent: "center" }}>
+                        <ArrowRight size={14} color="#4A5361" />
+                      </div>
+                      <div style={{ width: 190 }}>
+                        <input
+                          className="sw-map-input"
+                          value={m.destination}
+                          disabled={!m.include}
+                          onChange={(e) => updateMapping(m.key, { destination: e.target.value })}
+                          placeholder="destination_field"
+                        />
+                      </div>
+                      <div style={{ flex: 1, minWidth: 220, position: "relative" }}>
+                        <Code2
+                          size={13}
+                          color="#4A5361"
+                          style={{ position: "absolute", left: 9, top: 9.5, pointerEvents: "none" }}
+                        />
+                        <input
+                          className="sw-map-input"
+                          style={{ paddingLeft: 28, fontStyle: m.transform ? "normal" : "italic" }}
+                          value={m.transform}
+                          disabled={!m.include}
+                          onChange={(e) => updateMapping(m.key, { transform: e.target.value })}
+                          placeholder="e.g. value.toUpperCase()"
+                        />
+                      </div>
+                      <div style={{ width: 170, ...styles.mapPreviewCell, color: preview.ok ? "#7C8798" : "#E85D5D" }}>
+                        {String(preview.value)}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div style={styles.footNote}>
+                <Waypoints size={13} color="#5A6472" />
+                Preview only — transforms run safely against the full file on the backend, not here in the browser.
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Stat({ icon, label, value, tone }) {
+  return (
+    <div style={styles.stat}>
+      {icon}
+      <div>
+        <div
+          style={{
+            ...styles.statValue,
+            color: tone === "warn" ? "#E8A33D" : tone === "ok" ? "#57C278" : "#E8ECF1",
+          }}
+        >
+          {value}
+        </div>
+        <div style={styles.statLabel}>{label}</div>
+      </div>
+    </div>
+  );
+}
+
+function LoomMark() {
+  return (
+    <svg width="34" height="34" viewBox="0 0 34 34" fill="none">
+      <rect x="1" y="1" width="32" height="32" rx="8" stroke="#2A3341" strokeWidth="1" />
+      <path d="M7 11 H27 M7 17 H27 M7 23 H27" stroke="#3A4557" strokeWidth="1.4" />
+      <path d="M11 7 V27 M17 7 V27 M23 7 V27" stroke="#E8A33D" strokeWidth="1.4" opacity="0.9" />
+    </svg>
+  );
+}
+
+function WeaveBackdrop({ active }) {
+  const lines = [];
+  for (let i = 0; i < 22; i++) {
+    lines.push(
+      <line
+        key={`h${i}`}
+        className={active ? "sw-thread-line" : undefined}
+        x1="0"
+        y1={i * 34}
+        x2="1600"
+        y2={i * 34}
+        stroke="#141B26"
+        strokeWidth="1"
+      />
+    );
+  }
+  for (let i = 0; i < 46; i++) {
+    lines.push(
+      <line key={`v${i}`} x1={i * 34} y1="0" x2={i * 34} y2="760" stroke="#10161F" strokeWidth="1" />
+    );
+  }
+  return (
+    <svg
+      width="100%"
+      height="100%"
+      viewBox="0 0 1600 760"
+      preserveAspectRatio="none"
+      style={{
+        position: "absolute",
+        inset: 0,
+        opacity: 0.55,
+        pointerEvents: "none",
+        zIndex: 0,
+      }}
+    >
+      {lines}
+    </svg>
+  );
+}
+
+const styles = {
+  app: {
+    fontFamily: "'Inter', sans-serif",
+    background: "#0B0F14",
+    color: "#E8ECF1",
+    width: "100%",
+    height: "100vh",
+    boxSizing: "border-box",
+    display: "flex",
+    flexDirection: "column",
+    position: "relative",
+    overflow: "hidden",
+  },
+  header: {
+    position: "relative",
+    zIndex: 1,
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    padding: "28px clamp(20px, 4vw, 56px) 0",
+    flexShrink: 0,
+  },
+  brandRow: { display: "flex", alignItems: "center", gap: 12 },
+  brandName: {
+    fontFamily: "'Space Grotesk', sans-serif",
+    fontWeight: 700,
+    fontSize: 22,
+    letterSpacing: "-0.02em",
+    color: "#F3F5F8",
+  },
+  brandTag: { fontSize: 12.5, color: "#7C8798", marginTop: 2 },
+  heroWrap: {
+    position: "relative",
+    zIndex: 1,
+    flex: 1,
+    minHeight: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "0 24px",
+  },
+  dropRing: {
+    position: "absolute",
+    inset: "24px clamp(20px, 4vw, 56px)",
+    border: "1.5px dashed #232B38",
+    borderRadius: 20,
+    pointerEvents: "none",
+  },
+  hero: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    textAlign: "center",
+    maxWidth: 460,
+  },
+  dropTitle: {
+    fontFamily: "'Space Grotesk', sans-serif",
+    fontSize: 22,
+    fontWeight: 600,
+    color: "#F3F5F8",
+    marginTop: 18,
+  },
+  dropSub: { fontSize: 14, color: "#7C8798", marginTop: 8, lineHeight: 1.5 },
+  browseBtn: {
+    marginTop: 26,
+    background: "#E8A33D",
+    color: "#241A08",
+    border: "none",
+    fontFamily: "'Inter', sans-serif",
+    fontWeight: 600,
+    fontSize: 14,
+    padding: "10px 22px",
+    borderRadius: 8,
+    cursor: "pointer",
+  },
+  dropHint: { fontSize: 12, color: "#4A5361", marginTop: 14 },
+  errorLine: {
+    marginTop: 18,
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 12.5,
+    color: "#E85D5D",
+  },
+  progressTrack: {
+    width: 320,
+    maxWidth: "70vw",
+    height: 6,
+    background: "#1B222D",
+    borderRadius: 4,
+    marginTop: 26,
+    overflow: "hidden",
+  },
+  progressFill: { height: "100%", background: "#E8A33D", transition: "width 0.12s linear" },
+  parsingStats: {
+    marginTop: 14,
+    display: "flex",
+    gap: 8,
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 12.5,
+    color: "#7C8798",
+  },
+  readyWrap: {
+    position: "relative",
+    zIndex: 1,
+    flex: 1,
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+    padding: "18px clamp(20px, 4vw, 56px) 24px",
+  },
+  statsBar: {
+    display: "flex",
+    alignItems: "center",
+    gap: 22,
+    paddingBottom: 14,
+    flexWrap: "wrap",
+    flexShrink: 0,
+  },
+  stat: { display: "flex", alignItems: "center", gap: 8 },
+  statValue: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 14,
+    fontWeight: 600,
+    lineHeight: 1.1,
+  },
+  statLabel: { fontSize: 11, color: "#5A6472", marginTop: 1 },
+  statsSpacer: { flex: 1, minWidth: 4 },
+  segControl: {
+    display: "flex",
+    gap: 2,
+    background: "#0E1420",
+    border: "1px solid #1B222D",
+    borderRadius: 8,
+    padding: 3,
+  },
+  resetBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    background: "transparent",
+    color: "#B7C0CC",
+    border: "1px solid #2A3341",
+    fontSize: 12.5,
+    fontFamily: "'Inter', sans-serif",
+    padding: "8px 14px",
+    borderRadius: 7,
+    cursor: "pointer",
+  },
+  gridWrap: {
+    flex: 1,
+    minHeight: 0,
+    border: "1px solid #1B222D",
+    borderRadius: 10,
+    background: "#0E1420",
+    overflow: "hidden",
+  },
+  gridScrollX: {
+    width: "100%",
+    height: "100%",
+    overflowX: "auto",
+    overflowY: "hidden",
+  },
+  headerRow: {
+    display: "flex",
+    background: "#141B26",
+    borderBottom: "1px solid #232B38",
+    height: HEADER_HEIGHT,
+  },
+  headerCell: {
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    padding: "0 12px",
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 11.5,
+    fontWeight: 600,
+    color: "#9AA5B4",
+    textTransform: "uppercase",
+    letterSpacing: "0.03em",
+    borderRight: "1px solid #1B222D",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  dataCell: {
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    padding: "0 12px",
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 12.5,
+    color: "#C7CDD6",
+    borderRight: "1px solid #131924",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  footNote: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 11.5,
+    color: "#5A6472",
+    marginTop: 10,
+    paddingLeft: 2,
+    flexShrink: 0,
+  },
+  mapToolbar: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingBottom: 10,
+    flexShrink: 0,
+  },
+  mapToolbarText: { fontSize: 12, color: "#7C8798" },
+  copyBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 7,
+    background: "#171310",
+    color: "#E8A33D",
+    border: "1px solid #3A2C14",
+    fontFamily: "'Inter', sans-serif",
+    fontSize: 12.5,
+    fontWeight: 600,
+    padding: "8px 14px",
+    borderRadius: 7,
+    cursor: "pointer",
+  },
+  sendBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 7,
+    background: "#E8A33D",
+    color: "#241A08",
+    border: "none",
+    fontFamily: "'Inter', sans-serif",
+    fontSize: 12.5,
+    fontWeight: 700,
+    padding: "8px 14px",
+    borderRadius: 7,
+  },
+  sendPanel: {
+    border: "1px solid #1B222D",
+    background: "#0E1420",
+    borderRadius: 10,
+    padding: "14px 16px",
+    marginBottom: 12,
+    flexShrink: 0,
+  },
+  sendRow: { display: "flex", alignItems: "center", gap: 9 },
+  sendTitle: { fontSize: 13, color: "#E8ECF1", fontWeight: 500 },
+  progressTrack2: {
+    width: "100%",
+    height: 6,
+    background: "#1B222D",
+    borderRadius: 4,
+    marginTop: 12,
+    overflow: "hidden",
+  },
+  mapWrap: {
+    flex: 1,
+    minHeight: 0,
+    overflowY: "auto",
+    border: "1px solid #1B222D",
+    borderRadius: 10,
+    background: "#0E1420",
+  },
+  mapHeaderRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "10px 16px",
+    position: "sticky",
+    top: 0,
+    background: "#141B26",
+    borderBottom: "1px solid #232B38",
+    zIndex: 1,
+  },
+  mapHeadCell: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 10.5,
+    fontWeight: 600,
+    color: "#9AA5B4",
+    textTransform: "uppercase",
+    letterSpacing: "0.03em",
+  },
+  mapRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "9px 16px",
+    borderBottom: "1px solid #161D28",
+  },
+  mapSourceLabel: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 12.5,
+    color: "#E8ECF1",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  mapPreviewCell: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 12,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+};
